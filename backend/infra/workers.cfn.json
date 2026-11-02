@@ -1,0 +1,760 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Raasta SQS broker and notification ECS Fargate service. The ride API publishes directly after commit. Existing network, cluster, image and notification database secret are required; API deployment is separate.",
+  "Parameters": {
+    "ClusterName": {
+      "Type": "String",
+      "Description": "Existing ECS cluster name"
+    },
+    "PrivateSubnetIds": {
+      "Type": "List<AWS::EC2::Subnet::Id>",
+      "Description": "At least two private subnets with AWS endpoint/NAT connectivity"
+    },
+    "WorkerSecurityGroupId": {
+      "Type": "AWS::EC2::SecurityGroup::Id",
+      "Description": "Existing worker security group with outbound SQS and database access"
+    },
+    "ImageUri": {
+      "Type": "String",
+      "Description": "Immutable ECR image URI built from backend/Dockerfile"
+    },
+    "NotificationDatabaseSecretArn": {
+      "Type": "String",
+      "Description": "Separate secret whose entire plaintext value is the notification PostgreSQL URL"
+    },
+    "AlarmTopicArn": {
+      "Type": "String",
+      "Default": "",
+      "Description": "Optional existing SNS topic ARN for operations alerts"
+    },
+    "MaxNotificationTasks": {
+      "Type": "Number",
+      "Default": 20,
+      "MinValue": 2,
+      "MaxValue": 100
+    },
+    "SesFromEmail": {
+      "Type": "String",
+      "Default": "",
+      "Description": "Optional verified SES sender address; empty keeps record-only mode"
+    },
+    "SesIdentityArn": {
+      "Type": "String",
+      "Default": "",
+      "Description": "Verified SES sender/domain identity ARN in this region; required with SesFromEmail"
+    }
+  },
+  "Conditions": {
+    "HasAlarmTopic": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "AlarmTopicArn"
+            },
+            ""
+          ]
+        }
+      ]
+    },
+    "EmailEnabled": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "SesFromEmail"
+            },
+            ""
+          ]
+        }
+      ]
+    }
+  },
+  "Resources": {
+    "DeadLetterQueue": {
+      "Type": "AWS::SQS::Queue",
+      "Properties": {
+        "MessageRetentionPeriod": 1209600,
+        "SqsManagedSseEnabled": true
+      }
+    },
+    "EventsQueue": {
+      "Type": "AWS::SQS::Queue",
+      "Properties": {
+        "VisibilityTimeout": 120,
+        "ReceiveMessageWaitTimeSeconds": 20,
+        "MessageRetentionPeriod": 345600,
+        "SqsManagedSseEnabled": true,
+        "RedrivePolicy": {
+          "deadLetterTargetArn": {
+            "Fn::GetAtt": [
+              "DeadLetterQueue",
+              "Arn"
+            ]
+          },
+          "maxReceiveCount": 5
+        }
+      }
+    },
+    "QueuePolicy": {
+      "Type": "AWS::SQS::QueuePolicy",
+      "Properties": {
+        "Queues": [
+          {
+            "Ref": "EventsQueue"
+          },
+          {
+            "Ref": "DeadLetterQueue"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "sqs:*",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "EventsQueue",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::GetAtt": [
+                    "DeadLetterQueue",
+                    "Arn"
+                  ]
+                }
+              ],
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "WorkerLogs": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "RetentionInDays": 14
+      }
+    },
+    "ExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "service-permissions",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "secretsmanager:GetSecretValue"
+                  ],
+                  "Resource": [
+                    {
+                      "Ref": "NotificationDatabaseSecretArn"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+          }
+        ]
+      }
+    },
+    "NotificationRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "service-permissions",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "sqs:ReceiveMessage",
+                    "sqs:DeleteMessage"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "EventsQueue",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Fn::If": [
+                    "EmailEnabled",
+                    {
+                      "Effect": "Allow",
+                      "Action": [
+                        "ses:SendEmail"
+                      ],
+                      "Resource": {
+                        "Ref": "SesIdentityArn"
+                      },
+                      "Condition": {
+                        "StringEquals": {
+                          "ses:FromAddress": {
+                            "Ref": "SesFromEmail"
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "Ref": "AWS::NoValue"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "NotificationTask": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {
+        "RequiresCompatibilities": [
+          "FARGATE"
+        ],
+        "NetworkMode": "awsvpc",
+        "Cpu": "256",
+        "Memory": "512",
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": [
+            "ExecutionRole",
+            "Arn"
+          ]
+        },
+        "TaskRoleArn": {
+          "Fn::GetAtt": [
+            "NotificationRole",
+            "Arn"
+          ]
+        },
+        "RuntimePlatform": {
+          "CpuArchitecture": "X86_64",
+          "OperatingSystemFamily": "LINUX"
+        },
+        "ContainerDefinitions": [
+          {
+            "Name": "notification",
+            "Image": {
+              "Ref": "ImageUri"
+            },
+            "Essential": true,
+            "Command": [
+              "node",
+              "services/notifications/worker.js"
+            ],
+            "StopTimeout": 120,
+            "ReadonlyRootFilesystem": true,
+            "Environment": [
+              {
+                "Name": "AWS_REGION",
+                "Value": {
+                  "Ref": "AWS::Region"
+                }
+              },
+              {
+                "Name": "SQS_QUEUE_URL",
+                "Value": {
+                  "Ref": "EventsQueue"
+                }
+              },
+              {
+                "Name": "SES_FROM_EMAIL",
+                "Value": {
+                  "Ref": "SesFromEmail"
+                }
+              }
+            ],
+            "Secrets": [
+              {
+                "Name": "NOTIFICATIONS_DATABASE_URL",
+                "ValueFrom": {
+                  "Ref": "NotificationDatabaseSecretArn"
+                }
+              }
+            ],
+            "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                "awslogs-group": {
+                  "Ref": "WorkerLogs"
+                },
+                "awslogs-region": {
+                  "Ref": "AWS::Region"
+                },
+                "awslogs-stream-prefix": "notification"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "NotificationService": {
+      "Type": "AWS::ECS::Service",
+      "Properties": {
+        "Cluster": {
+          "Ref": "ClusterName"
+        },
+        "TaskDefinition": {
+          "Ref": "NotificationTask"
+        },
+        "LaunchType": "FARGATE",
+        "DesiredCount": 2,
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "AssignPublicIp": "DISABLED",
+            "Subnets": {
+              "Ref": "PrivateSubnetIds"
+            },
+            "SecurityGroups": [
+              {
+                "Ref": "WorkerSecurityGroupId"
+              }
+            ]
+          }
+        },
+        "DeploymentConfiguration": {
+          "MinimumHealthyPercent": 100,
+          "MaximumPercent": 200,
+          "DeploymentCircuitBreaker": {
+            "Enable": true,
+            "Rollback": true
+          }
+        }
+      }
+    },
+    "ScalingRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "application-autoscaling.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "service-permissions",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ecs:DescribeServices",
+                    "ecs:UpdateService"
+                  ],
+                  "Resource": {
+                    "Ref": "NotificationService"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "cloudwatch:DescribeAlarms",
+                    "cloudwatch:PutMetricAlarm",
+                    "cloudwatch:DeleteAlarms"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "WorkerScalingTarget": {
+      "Type": "AWS::ApplicationAutoScaling::ScalableTarget",
+      "Properties": {
+        "MinCapacity": 2,
+        "MaxCapacity": {
+          "Ref": "MaxNotificationTasks"
+        },
+        "ResourceId": {
+          "Fn::Join": [
+            "",
+            [
+              "service/",
+              {
+                "Ref": "ClusterName"
+              },
+              "/",
+              {
+                "Fn::GetAtt": [
+                  "NotificationService",
+                  "Name"
+                ]
+              }
+            ]
+          ]
+        },
+        "RoleARN": {
+          "Fn::GetAtt": [
+            "ScalingRole",
+            "Arn"
+          ]
+        },
+        "ScalableDimension": "ecs:service:DesiredCount",
+        "ServiceNamespace": "ecs"
+      }
+    },
+    "ScaleOutPolicy": {
+      "Type": "AWS::ApplicationAutoScaling::ScalingPolicy",
+      "Properties": {
+        "PolicyName": {
+          "Fn::Sub": "${AWS::StackName}-ScaleOutPolicy"
+        },
+        "PolicyType": "StepScaling",
+        "ScalingTargetId": {
+          "Ref": "WorkerScalingTarget"
+        },
+        "StepScalingPolicyConfiguration": {
+          "AdjustmentType": "ChangeInCapacity",
+          "Cooldown": 60,
+          "MetricAggregationType": "Average",
+          "StepAdjustments": [
+            {
+              "ScalingAdjustment": 1,
+              "MetricIntervalLowerBound": 0
+            }
+          ]
+        }
+      }
+    },
+    "ScaleInPolicy": {
+      "Type": "AWS::ApplicationAutoScaling::ScalingPolicy",
+      "Properties": {
+        "PolicyName": {
+          "Fn::Sub": "${AWS::StackName}-ScaleInPolicy"
+        },
+        "PolicyType": "StepScaling",
+        "ScalingTargetId": {
+          "Ref": "WorkerScalingTarget"
+        },
+        "StepScalingPolicyConfiguration": {
+          "AdjustmentType": "ChangeInCapacity",
+          "Cooldown": 300,
+          "MetricAggregationType": "Average",
+          "StepAdjustments": [
+            {
+              "ScalingAdjustment": -1,
+              "MetricIntervalUpperBound": 0
+            }
+          ]
+        }
+      }
+    },
+    "QueueDelayAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": "AWS/SQS",
+        "MetricName": "ApproximateAgeOfOldestMessage",
+        "Dimensions": [
+          {
+            "Name": "QueueName",
+            "Value": {
+              "Fn::GetAtt": [
+                "EventsQueue",
+                "QueueName"
+              ]
+            }
+          }
+        ],
+        "Period": 60,
+        "EvaluationPeriods": 2,
+        "Statistic": "Maximum",
+        "Threshold": 30,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": {
+          "Fn::If": [
+            "HasAlarmTopic",
+            [
+              {
+                "Ref": "ScaleOutPolicy"
+              },
+              {
+                "Ref": "AlarmTopicArn"
+              }
+            ],
+            [
+              {
+                "Ref": "ScaleOutPolicy"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    "EmptyQueueAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": "AWS/SQS",
+        "MetricName": "ApproximateNumberOfMessagesVisible",
+        "Dimensions": [
+          {
+            "Name": "QueueName",
+            "Value": {
+              "Fn::GetAtt": [
+                "EventsQueue",
+                "QueueName"
+              ]
+            }
+          }
+        ],
+        "Period": 60,
+        "EvaluationPeriods": 10,
+        "Statistic": "Maximum",
+        "Threshold": 0,
+        "ComparisonOperator": "LessThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "ScaleInPolicy"
+          }
+        ]
+      }
+    },
+    "DeadLetterAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": "AWS/SQS",
+        "MetricName": "ApproximateNumberOfMessagesVisible",
+        "Dimensions": [
+          {
+            "Name": "QueueName",
+            "Value": {
+              "Fn::GetAtt": [
+                "DeadLetterQueue",
+                "QueueName"
+              ]
+            }
+          }
+        ],
+        "Period": 60,
+        "EvaluationPeriods": 1,
+        "Statistic": "Maximum",
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": {
+          "Fn::If": [
+            "HasAlarmTopic",
+            [
+              {
+                "Ref": "AlarmTopicArn"
+              }
+            ],
+            []
+          ]
+        }
+      }
+    },
+    "WorkerFailureFilter": {
+      "Type": "AWS::Logs::MetricFilter",
+      "Properties": {
+        "LogGroupName": {
+          "Ref": "WorkerLogs"
+        },
+        "FilterPattern": "{ ($.event = \"message_failed\") || ($.event = \"cycle_failed\") }",
+        "MetricTransformations": [
+          {
+            "MetricName": "WorkerFailures",
+            "MetricNamespace": {
+              "Fn::Sub": "${AWS::StackName}/Workers"
+            },
+            "MetricValue": "1",
+            "DefaultValue": 0
+          }
+        ]
+      }
+    },
+    "WorkerFailureAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": {
+          "Fn::Sub": "${AWS::StackName}/Workers"
+        },
+        "MetricName": "WorkerFailures",
+        "Statistic": "Sum",
+        "Period": 60,
+        "EvaluationPeriods": 1,
+        "Threshold": 5,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": {
+          "Fn::If": [
+            "HasAlarmTopic",
+            [
+              {
+                "Ref": "AlarmTopicArn"
+              }
+            ],
+            []
+          ]
+        }
+      }
+    },
+    "ApiQueuePolicy": {
+      "Type": "AWS::IAM::ManagedPolicy",
+      "Properties": {
+        "Description": "Attach to the existing ride API task role for direct SQS publishing",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "sqs:SendMessage"
+              ],
+              "Resource": {
+                "Fn::GetAtt": [
+                  "EventsQueue",
+                  "Arn"
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "QueueUrl": {
+      "Value": {
+        "Ref": "EventsQueue"
+      }
+    },
+    "DeadLetterQueueUrl": {
+      "Value": {
+        "Ref": "DeadLetterQueue"
+      }
+    },
+    "WorkerLogGroup": {
+      "Value": {
+        "Ref": "WorkerLogs"
+      }
+    },
+    "NotificationTaskDefinition": {
+      "Value": {
+        "Ref": "NotificationTask"
+      }
+    },
+    "ApiQueuePolicyArn": {
+      "Value": {
+        "Ref": "ApiQueuePolicy"
+      }
+    }
+  },
+  "Rules": {
+    "EmailSettings": {
+      "Assertions": [
+        {
+          "Assert": {
+            "Fn::Or": [
+              {
+                "Fn::And": [
+                  {
+                    "Fn::Equals": [
+                      {
+                        "Ref": "SesFromEmail"
+                      },
+                      ""
+                    ]
+                  },
+                  {
+                    "Fn::Equals": [
+                      {
+                        "Ref": "SesIdentityArn"
+                      },
+                      ""
+                    ]
+                  }
+                ]
+              },
+              {
+                "Fn::And": [
+                  {
+                    "Fn::Not": [
+                      {
+                        "Fn::Equals": [
+                          {
+                            "Ref": "SesFromEmail"
+                          },
+                          ""
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "Fn::Not": [
+                      {
+                        "Fn::Equals": [
+                          {
+                            "Ref": "SesIdentityArn"
+                          },
+                          ""
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "AssertDescription": "Set both SesFromEmail and SesIdentityArn, or leave both empty."
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "name": "@lahore-rides/backend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --env-file-if-exists=.env src/server.js",
+    "build": "node scripts/check.mjs",
+    "check": "node scripts/check.mjs",
+    "start": "node --env-file-if-exists=.env src/server.js",
+    "test": "vitest run",
+    "db:migrate": "node --env-file-if-exists=.env src/db/migrate.js",
+    "db:seed": "node --env-file-if-exists=.env src/db/seed.js",
+    "worker:notifications": "node --env-file-if-exists=.env services/notifications/worker.js",
+    "notifications:migrate": "node --env-file-if-exists=.env services/notifications/migrate.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sesv2": "^3.1161.0",
+    "@aws-sdk/client-sqs": "^3.1161.0",
+    "cors": "^2.8.6",
+    "express": "^5.1.0",
+    "express-validator": "^7.3.0",
+    "helmet": "^8.1.0",
+    "pg": "^8.16.3",
+    "pino-http": "^10.5.0",
+    "redis": "^6.3.1",
+    "ws": "^8.22.1"
+  },
+  "devDependencies": {
+    "supertest": "^7.1.4",
+    "vitest": "^3.2.4"
+  }
+}
