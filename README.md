@@ -225,8 +225,6 @@ The helper normally sets a 15-second timeout. Quote calls supply their own cance
 
 The current demo has no user authentication. Production must check ride ownership before allowing a socket subscription, just as it must protect ride HTTP endpoints.
 
-For every backend file, see [FILE_GUIDE.md](FILE_GUIDE.md).
-
 ## 1. Setup
 
 Requires Node.js 22.12+ or 24, npm, and Docker Desktop, or existing database services. Inside `backend/`, run `npm ci`, then copy `.env.example` to `.env`. Set the database password and use the same password in `DATABASE_URL`.
