@@ -2,10 +2,6 @@
 
 A ride-booking API for the website and a future mobile app.
 
-See [FILE_GUIDE.md](FILE_GUIDE.md) for a simple explanation of every backend folder and file.
-
-
-
 - **Express:** handles API requests.
 - **PostgreSQL:** saves riders, drivers, and rides safely.
 - **Redis:** caches the driver list and shares live-update signals between backend instances.
